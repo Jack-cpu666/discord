@@ -1,14 +1,10 @@
-import eventlet
-# The monkey patch is now applied *after* the Redis connection is established.
-
 import os
 import time
 import redis
-from flask import Flask, request, session, redirect, url_for, render_template_string
-from flask_socketio import SocketIO, emit
-from flask_socketio import disconnect as server_disconnect_client
 import sys
 import logging
+import threading
+from urllib.parse import urlparse
 
 # --- Logging Setup ---
 log_format = '%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s'
@@ -20,37 +16,102 @@ SECRET_KEY = os.environ.get('FLASK_SECRET_KEY', 'change_this_strong_secret_key_1
 ACCESS_PASSWORD = os.environ.get('REMOTE_ACCESS_PASSWORD', '1')
 REDIS_URL = os.environ.get('REDIS_URL')
 
-# --- App & Redis Setup (CRITICAL FIX) ---
+# --- Critical Redis Setup BEFORE any imports that might monkey patch ---
 if not REDIS_URL:
     logger.critical("FATAL: REDIS_URL environment variable not set! The server cannot run without it.")
     sys.exit(1)
 
-# STEP 1: Connect to Redis BEFORE monkey-patching.
-# This uses the standard system DNS resolver, which is reliable in container environments.
+# Parse Redis URL to get connection details
+redis_url_parsed = urlparse(REDIS_URL)
+redis_host = redis_url_parsed.hostname
+redis_port = redis_url_parsed.port or 6379
+redis_password = redis_url_parsed.password
+redis_db = int(redis_url_parsed.path.lstrip('/')) if redis_url_parsed.path else 0
+
+# Use standard socket DNS resolution to avoid eventlet interference
+import socket
+redis_ip = None
 try:
-    redis_client = redis.from_url(REDIS_URL, decode_responses=True)
-    # Ping the server to ensure a connection is made and authenticated.
+    # Resolve Redis hostname to IP before monkey patching
+    redis_ip = socket.gethostbyname(redis_host)
+    logger.info(f"Resolved Redis host {redis_host} to IP {redis_ip}")
+except Exception as e:
+    logger.critical(f"FATAL: Could not resolve Redis hostname {redis_host}: {e}")
+    sys.exit(1)
+
+# Create Redis connection pool with IP address instead of hostname
+redis_connection_pool = redis.ConnectionPool(
+    host=redis_ip,  # Use IP instead of hostname
+    port=redis_port,
+    password=redis_password,
+    db=redis_db,
+    decode_responses=True,
+    socket_connect_timeout=10,
+    socket_timeout=10,
+    retry_on_timeout=True,
+    health_check_interval=30
+)
+
+# Test initial connection
+try:
+    redis_client = redis.Redis(connection_pool=redis_connection_pool)
     redis_client.ping()
-    logger.info("Successfully connected to Redis at startup.")
+    logger.info("Successfully connected to Redis at startup using IP address.")
 except redis.exceptions.ConnectionError as e:
     logger.critical(f"FATAL: Could not connect to Redis at startup: {e}")
     sys.exit(1)
 
-# STEP 2: Now that the Redis connection is established, apply the monkey-patch
-# for eventlet to handle WebSocket connections efficiently.
+# NOW it's safe to monkey patch after Redis connection is established
+import eventlet
 eventlet.monkey_patch()
 
-# STEP 3: Initialize Flask and SocketIO AFTER patching.
+# Import Flask after monkey patching
+from flask import Flask, request, session, redirect, url_for, render_template_string
+from flask_socketio import SocketIO, emit
+from flask_socketio import disconnect as server_disconnect_client
+
+# --- App Setup ---
 app = Flask(__name__)
 app.config['SECRET_KEY'] = SECRET_KEY
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100 MB upload limit
 socketio = SocketIO(app, async_mode='eventlet', cors_allowed_origins="*", ping_timeout=90, ping_interval=30,
                     max_http_buffer_size=20 * 1024 * 1024, logger=False, engineio_logger=False)
 
-
 # --- Redis Key Management ---
 CLIENT_REDIS_KEY = f"remote_client_sid:{ACCESS_PASSWORD}"
 
+# --- Redis Helper Functions with Error Handling ---
+def safe_redis_get(key, default=None):
+    """Safely get a value from Redis with error handling"""
+    try:
+        return redis_client.get(key)
+    except Exception as e:
+        logger.error(f"Redis GET error for key {key}: {e}")
+        return default
+
+def safe_redis_set(key, value, ex=None):
+    """Safely set a value in Redis with error handling"""
+    try:
+        return redis_client.set(key, value, ex=ex)
+    except Exception as e:
+        logger.error(f"Redis SET error for key {key}: {e}")
+        return False
+
+def safe_redis_delete(key):
+    """Safely delete a key from Redis with error handling"""
+    try:
+        return redis_client.delete(key)
+    except Exception as e:
+        logger.error(f"Redis DELETE error for key {key}: {e}")
+        return False
+
+def safe_redis_exists(key):
+    """Safely check if key exists in Redis with error handling"""
+    try:
+        return redis_client.exists(key)
+    except Exception as e:
+        logger.error(f"Redis EXISTS error for key {key}: {e}")
+        return False
 
 # --- Authentication ---
 def check_auth(password):
@@ -148,7 +209,7 @@ INTERFACE_HTML = """
         function cleanupState() { remoteScreenWidth = null; remoteScreenHeight = null; screenImage.src = 'data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs='; }
         socket.on('connect', () => { updateStatus('status-connecting', 'Server connected, waiting for PC...'); socket.emit('check_client_status'); });
         socket.on('disconnect', () => { updateStatus('status-disconnected', 'Server disconnected'); cleanupState(); });
-        socket.on('connect_error', () => { updateStatus('status-disconnected', 'Connection Error'); cleanup_state(); });
+        socket.on('connect_error', () => { updateStatus('status-disconnected', 'Connection Error'); cleanupState(); });
         socket.on('client_connected', () => { updateStatus('status-connected', 'Remote PC Connected'); document.body.focus(); });
         socket.on('client_disconnected', () => { updateStatus('status-disconnected', 'Remote PC Disconnected'); cleanupState(); });
         socket.on('command_error', (data) => console.error(`Command Error: ${data.message}`));
@@ -188,6 +249,21 @@ INTERFACE_HTML = """
 </html>
 """
 
+# --- Health Check Background Task ---
+def redis_health_check():
+    """Background task to monitor Redis health"""
+    while True:
+        try:
+            redis_client.ping()
+            time.sleep(30)  # Check every 30 seconds
+        except Exception as e:
+            logger.error(f"Redis health check failed: {e}")
+            time.sleep(5)  # Check more frequently when failing
+
+# Start health check in background thread
+health_check_thread = threading.Thread(target=redis_health_check, daemon=True)
+health_check_thread.start()
+
 # --- Flask Routes ---
 @app.route('/', methods=['GET', 'POST'])
 def index():
@@ -219,17 +295,15 @@ def handle_connect():
 
 @socketio.on('disconnect')
 def handle_disconnect():
-    # This disconnect could be a browser tab or the remote client.
-    # The remote client's specific disconnect logic is in the next handler.
     logger.info(f"A client disconnected: SID={request.sid}")
 
 @socketio.on('disconnect', namespace='/')
 def handle_client_disconnect():
-    # This specifically checks if the disconnecting client is our registered PC
-    client_pc_sid = redis_client.get(CLIENT_REDIS_KEY)
+    """Handle client disconnection and clean up Redis state"""
+    client_pc_sid = safe_redis_get(CLIENT_REDIS_KEY)
     if request.sid == client_pc_sid:
         logger.warning(f"Remote PC (SID: {client_pc_sid}) disconnected. Clearing Redis key.")
-        redis_client.delete(CLIENT_REDIS_KEY)
+        safe_redis_delete(CLIENT_REDIS_KEY)
         emit('client_disconnected', broadcast=True, include_self=False)
 
 @socketio.on('register_client')
@@ -237,17 +311,23 @@ def handle_register_client(data):
     client_token = data.get('token')
     sid = request.sid
     if client_token == ACCESS_PASSWORD:
-        old_sid = redis_client.get(CLIENT_REDIS_KEY)
+        old_sid = safe_redis_get(CLIENT_REDIS_KEY)
         if old_sid and old_sid != sid:
             logger.warning(f"New client auth, disconnecting old client (SID: {old_sid})")
             try:
                 server_disconnect_client(old_sid, silent=True)
             except Exception:
-                pass # Ignore errors if old client is already gone
-        redis_client.set(CLIENT_REDIS_KEY, sid)
-        logger.info(f"Remote PC registered (SID: {sid}). State saved to Redis.")
-        emit('client_connected', broadcast=True, include_self=False)
-        emit('registration_success', room=sid)
+                pass  # Ignore errors if old client is already gone
+        
+        # Store new client SID in Redis
+        if safe_redis_set(CLIENT_REDIS_KEY, sid):
+            logger.info(f"Remote PC registered (SID: {sid}). State saved to Redis.")
+            emit('client_connected', broadcast=True, include_self=False)
+            emit('registration_success', room=sid)
+        else:
+            logger.error(f"Failed to save client SID to Redis for {sid}")
+            emit('registration_fail', {'message': 'Server error.'}, room=sid)
+            server_disconnect_client(sid)
     else:
         logger.warning(f"Client registration failed for SID {sid}. Incorrect password.")
         emit('registration_fail', {'message': 'Auth failed.'}, room=sid)
@@ -255,8 +335,12 @@ def handle_register_client(data):
 
 @socketio.on('check_client_status')
 def check_client_status():
-    if redis_client.exists(CLIENT_REDIS_KEY):
-        emit('client_connected')
+    """Check if client is connected using safe Redis operations"""
+    try:
+        if safe_redis_exists(CLIENT_REDIS_KEY):
+            emit('client_connected')
+    except Exception as e:
+        logger.error(f"Error checking client status: {e}")
 
 @socketio.on('ping_from_browser')
 def handle_ping():
@@ -264,25 +348,34 @@ def handle_ping():
 
 @socketio.on('screen_data_bytes')
 def handle_screen_data_bytes(data):
-    if redis_client.get(CLIENT_REDIS_KEY) == request.sid:
+    """Handle screen data from client with Redis safety"""
+    current_client_sid = safe_redis_get(CLIENT_REDIS_KEY)
+    if current_client_sid == request.sid:
         emit('screen_frame_bytes', data, broadcast=True, include_self=False)
 
 def forward_to_client(event, data):
-    client_pc_sid = redis_client.get(CLIENT_REDIS_KEY)
+    """Forward event to client with safe Redis operations"""
+    client_pc_sid = safe_redis_get(CLIENT_REDIS_KEY)
     if client_pc_sid:
-        socketio.emit(event, data, room=client_pc_sid)
-        return True
+        try:
+            socketio.emit(event, data, room=client_pc_sid)
+            return True
+        except Exception as e:
+            logger.error(f"Error forwarding {event} to client {client_pc_sid}: {e}")
+            return False
     return False
 
 @socketio.on('control_command')
 def handle_control_command(data):
-    if not session.get('authenticated'): return
+    if not session.get('authenticated'): 
+        return
     if not forward_to_client('command', data):
         emit('command_error', {'message': 'Remote PC not connected.'})
 
 @socketio.on('set_injection_text')
 def handle_set_injection_text(data):
-    if not session.get('authenticated'): return
+    if not session.get('authenticated'): 
+        return
     if forward_to_client('receive_injection_text', {'text': data.get('text_to_inject', '')}):
         emit('text_injection_set_ack', {'status': 'success'})
     else:
@@ -290,39 +383,55 @@ def handle_set_injection_text(data):
 
 @socketio.on('update_client_settings')
 def handle_update_settings(data):
-    if not session.get('authenticated'): return
+    if not session.get('authenticated'): 
+        return
     logger.info(f"Forwarding settings update to client: {data}")
     forward_to_client('receive_settings_update', data)
 
 @socketio.on('clipboard_from_browser')
 def handle_clipboard_from_browser(data):
-    if not session.get('authenticated'): return
+    if not session.get('authenticated'): 
+        return
     forward_to_client('set_clipboard', data)
 
 @socketio.on('clipboard_from_client')
 def handle_clipboard_from_client(data):
-    if redis_client.get(CLIENT_REDIS_KEY) == request.sid:
+    current_client_sid = safe_redis_get(CLIENT_REDIS_KEY)
+    if current_client_sid == request.sid:
         emit('update_browser_clipboard', data, broadcast=True, include_self=False)
 
 @socketio.on('file_chunk')
 def handle_file_chunk(data, callback):
-    if not session.get('authenticated'): return
+    if not session.get('authenticated'): 
+        return
     if forward_to_client('receive_file_chunk', data):
-        if callback: callback({'status': 'ok'})
+        if callback: 
+            callback({'status': 'ok'})
     else:
-        if callback: callback({'status': 'error', 'message': 'Client not connected'})
+        if callback: 
+            callback({'status': 'error', 'message': 'Client not connected'})
 
 @socketio.on('file_upload_complete')
 def handle_file_upload_complete(data):
-    if not session.get('authenticated'): return
+    if not session.get('authenticated'): 
+        return
     forward_to_client('file_transfer_complete', data)
 
+# --- Error Handlers ---
+@app.errorhandler(Exception)
+def handle_exception(e):
+    logger.error(f"Unhandled exception: {e}")
+    return "Internal Server Error", 500
 
 if __name__ == '__main__':
     logger.info("--- Advanced Remote Server Starting ---")
-    port = int(os.environ.get('PORT', 5000)); host = '0.0.0.0'
+    port = int(os.environ.get('PORT', 5000))
+    host = '0.0.0.0'
     logger.info(f"Listening on http://{host}:{port}")
+    logger.info(f"Using Redis at {redis_host}:{redis_port} (resolved to {redis_ip})")
+    
     if ACCESS_PASSWORD == '1':
         logger.warning("USING DEFAULT SERVER ACCESS PASSWORD '1'!")
+    
     # Use socketio.run() to correctly start the eventlet server
     socketio.run(app, host=host, port=port, debug=False)
