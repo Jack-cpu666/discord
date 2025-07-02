@@ -116,6 +116,8 @@ async def analyze_screenshot_with_claude(image_base64):
         logger.error("ANTHROPIC_API_KEY not set")
         return None
     
+    # Use hostname for HTTPS requests to avoid SSL issues
+    api_url = "https://api.anthropic.com/v1/messages"
     headers = {
         "x-api-key": ANTHROPIC_API_KEY,
         "content-type": "application/json",
@@ -148,8 +150,10 @@ async def analyze_screenshot_with_claude(image_base64):
     }
     
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(CLAUDE_API_URL, headers=headers, json=payload, timeout=30) as response:
+        # Create a longer timeout and better error handling
+        timeout = aiohttp.ClientTimeout(total=60, connect=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(api_url, headers=headers, json=payload) as response:
                 if response.status == 200:
                     result = await response.json()
                     content = result.get('content', [])
@@ -159,6 +163,9 @@ async def analyze_screenshot_with_claude(image_base64):
                     error_text = await response.text()
                     logger.error(f"Claude API error {response.status}: {error_text}")
                     return None
+    except asyncio.TimeoutError:
+        logger.error("Claude API request timed out")
+        return None
     except Exception as e:
         logger.error(f"Error calling Claude API: {e}")
         return None
@@ -572,12 +579,15 @@ def process_ai_screenshot(screenshot_base64):
                     'full_response': full_response
                 }), ex=300)  # Expire after 5 minutes
                 
-                # Send result to all browsers
-                socketio.emit('ai_analysis_complete', {
-                    'answer': answer,
-                    'answer_type': answer_type,
-                    'full_response': full_response
-                }, broadcast=True)
+                # Send result to all browsers - emit to all connected clients
+                try:
+                    socketio.emit('ai_analysis_complete', {
+                        'answer': answer,
+                        'answer_type': answer_type,
+                        'full_response': full_response
+                    })
+                except Exception as e:
+                    logger.error(f"Error emitting ai_analysis_complete: {e}")
                 
                 # Send to client for auto-action
                 forward_to_client('ai_answer_ready', {
@@ -587,15 +597,24 @@ def process_ai_screenshot(screenshot_base64):
                 
                 logger.info(f"AI Analysis complete: {answer} (type: {answer_type})")
             else:
-                socketio.emit('ai_analysis_complete', {'answer': None}, broadcast=True)
+                try:
+                    socketio.emit('ai_analysis_complete', {'answer': None})
+                except Exception as e:
+                    logger.error(f"Error emitting ai_analysis_complete (no answer): {e}")
                 logger.info("AI could not extract answer from screenshot")
         else:
-            socketio.emit('ai_analysis_error', broadcast=True)
+            try:
+                socketio.emit('ai_analysis_error', {'message': 'AI analysis failed'})
+            except Exception as e:
+                logger.error(f"Error emitting ai_analysis_error: {e}")
             logger.error("AI analysis failed")
             
     except Exception as e:
         logger.error(f"Error in AI screenshot processing: {e}")
-        socketio.emit('ai_analysis_error', broadcast=True)
+        try:
+            socketio.emit('ai_analysis_error', {'message': str(e)})
+        except Exception as emit_error:
+            logger.error(f"Error emitting error message: {emit_error}")
 
 def forward_to_client(event, data):
     client_pc_sid = safe_redis_get(CLIENT_REDIS_KEY)
@@ -679,3 +698,15 @@ if __name__ == '__main__':
         logger.warning("⚠️  ANTHROPIC_API_KEY not set - AI features will be disabled")
     
     socketio.run(app, host=host, port=port, debug=False)
+else:
+    # When running with gunicorn
+    logger.info("--- 🤖 AI-Enhanced Remote Server Starting with Gunicorn ---")
+    logger.info(f"🔐 Login password: {ACCESS_PASSWORD}")
+    
+    if ANTHROPIC_API_KEY:
+        logger.info("✅ Claude AI integration enabled")
+    else:
+        logger.warning("⚠️  ANTHROPIC_API_KEY not set - AI features will be disabled")
+
+# Export for gunicorn (SocketIO apps need the socketio object)
+application = socketio
