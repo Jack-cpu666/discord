@@ -1,12 +1,5 @@
-Flask==3.0.0
+Flask==2.3.3
 Flask-SocketIO==5.3.6
-python-socketio==5.10.0
-python-engineio==4.7.1
-Pillow==10.1.0
-mss==9.0.1
-keyboard==0.13.5
-psutil==5.9.6
-pyautogui==0.9.54
-pywin32==306; sys_platform == "win32"
-setuptools==69.0.2
+eventlet==0.33.3
 gunicorn==21.2.0
+redis==5.0.1
