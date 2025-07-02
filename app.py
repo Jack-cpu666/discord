@@ -1,10 +1,10 @@
 import eventlet
-eventlet.monkey_patch()
+# The monkey patch is now applied *after* the Redis connection is established.
 
 import os
 import time
 import redis
-from flask import Flask, request, session, redirect, url_for, render_template_string, jsonify
+from flask import Flask, request, session, redirect, url_for, render_template_string
 from flask_socketio import SocketIO, emit
 from flask_socketio import disconnect as server_disconnect_client
 import sys
@@ -20,24 +20,35 @@ SECRET_KEY = os.environ.get('FLASK_SECRET_KEY', 'change_this_strong_secret_key_1
 ACCESS_PASSWORD = os.environ.get('REMOTE_ACCESS_PASSWORD', '1')
 REDIS_URL = os.environ.get('REDIS_URL')
 
-# --- App & Redis Setup ---
+# --- App & Redis Setup (CRITICAL FIX) ---
 if not REDIS_URL:
     logger.critical("FATAL: REDIS_URL environment variable not set! The server cannot run without it.")
     sys.exit(1)
 
+# STEP 1: Connect to Redis BEFORE monkey-patching.
+# This uses the standard system DNS resolver, which is reliable in container environments.
+try:
+    redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+    # Ping the server to ensure a connection is made and authenticated.
+    redis_client.ping()
+    logger.info("Successfully connected to Redis at startup.")
+except redis.exceptions.ConnectionError as e:
+    logger.critical(f"FATAL: Could not connect to Redis at startup: {e}")
+    sys.exit(1)
+
+# STEP 2: Now that the Redis connection is established, apply the monkey-patch
+# for eventlet to handle WebSocket connections efficiently.
+eventlet.monkey_patch()
+
+# STEP 3: Initialize Flask and SocketIO AFTER patching.
 app = Flask(__name__)
 app.config['SECRET_KEY'] = SECRET_KEY
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100 MB upload limit
 socketio = SocketIO(app, async_mode='eventlet', cors_allowed_origins="*", ping_timeout=90, ping_interval=30,
                     max_http_buffer_size=20 * 1024 * 1024, logger=False, engineio_logger=False)
 
-# Connect to Redis. decode_responses=True makes it return strings instead of bytes.
-redis_client = redis.from_url(REDIS_URL, decode_responses=True)
-logger.info("Successfully connected to Redis.")
 
 # --- Redis Key Management ---
-# Using a consistent key for our single remote client.
-# For a multi-client system, this would be more dynamic.
 CLIENT_REDIS_KEY = f"remote_client_sid:{ACCESS_PASSWORD}"
 
 
@@ -46,7 +57,6 @@ def check_auth(password):
     return password == ACCESS_PASSWORD
 
 # --- HTML Templates ---
-# NOTE: Login HTML is unchanged from your version, so it's collapsed for brevity.
 LOGIN_HTML = """
 <!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Remote Control - Login</title><script src="https://cdn.tailwindcss.com"></script><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet"><style> body { font-family: 'Inter', sans-serif; } </style></head><body class="bg-gray-100 flex items-center justify-center h-screen"><div class="bg-white p-8 rounded-lg shadow-md w-full max-w-sm"><h1 class="text-2xl font-semibold text-center text-gray-700 mb-6">Remote Access Login</h1>{% if error %}<div class="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative mb-4" role="alert"><span class="block sm:inline">{{ error }}</span></div>{% endif %}<form method="POST" action="{{ url_for('index') }}"><div class="mb-4"><label for="password" class="block text-gray-700 text-sm font-medium mb-2">Password</label><input type="password" id="password" name="password" required class="w-full px-4 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent" placeholder="Enter access password"></div><button type="submit" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-2 px-4 rounded-md transition duration-200 ease-in-out">Login</button></form></div></body></html>
 """
@@ -82,7 +92,6 @@ INTERFACE_HTML = """
     </style>
 </head>
 <body class="bg-gray-200 flex flex-col h-screen" tabindex="0">
-
     <header class="bg-gray-800 text-white p-3 flex justify-between items-center shadow-md flex-shrink-0 h-14">
         <h1 class="text-lg font-semibold">Remote Desktop</h1>
         <div class="flex items-center space-x-4">
@@ -101,7 +110,6 @@ INTERFACE_HTML = """
             <a href="{{ url_for('logout') }}" class="bg-red-600 hover:bg-red-700 text-white text-xs font-medium py-1 px-2 rounded-md">Logout</a>
         </div>
     </header>
-
     <main id="main-content" class="p-2">
         <div id="screen-view-area">
             <img id="screen-image" src="data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=" alt="Remote Screen">
@@ -114,13 +122,11 @@ INTERFACE_HTML = """
             </div>
         </div>
     </main>
-
     <div id="file-progress-container">
         <span id="file-name-progress"></span>
         <div id="file-progress-bar"><div id="file-progress"></div></div>
         <span id="file-percent-progress">0%</span>
     </div>
-
     <script>
     document.addEventListener('DOMContentLoaded', () => {
         const socket = io(window.location.origin, { path: '/socket.io/' });
@@ -133,27 +139,19 @@ INTERFACE_HTML = """
         const fpsSlider = document.getElementById('fps-slider');
         const uploadButton = document.getElementById('upload-file-button');
         const fileInput = document.getElementById('file-input');
-
         let remoteScreenWidth = null;
         let remoteScreenHeight = null;
         let currentImageUrl = null;
-
         document.body.focus();
-        document.addEventListener('click', (e) => {
-            if (document.getElementById('text-input-area').contains(e.target)) return;
-            document.body.focus();
-        });
-
+        document.addEventListener('click', (e) => { if (document.getElementById('text-input-area').contains(e.target)) return; document.body.focus(); });
         function updateStatus(status, message) { statusText.textContent = message; statusDot.className = `status-dot ${status}`; }
         function cleanupState() { remoteScreenWidth = null; remoteScreenHeight = null; screenImage.src = 'data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs='; }
-
         socket.on('connect', () => { updateStatus('status-connecting', 'Server connected, waiting for PC...'); socket.emit('check_client_status'); });
         socket.on('disconnect', () => { updateStatus('status-disconnected', 'Server disconnected'); cleanupState(); });
-        socket.on('connect_error', () => { updateStatus('status-disconnected', 'Connection Error'); cleanupState(); });
+        socket.on('connect_error', () => { updateStatus('status-disconnected', 'Connection Error'); cleanup_state(); });
         socket.on('client_connected', () => { updateStatus('status-connected', 'Remote PC Connected'); document.body.focus(); });
         socket.on('client_disconnected', () => { updateStatus('status-disconnected', 'Remote PC Disconnected'); cleanupState(); });
         socket.on('command_error', (data) => console.error(`Command Error: ${data.message}`));
-
         socket.on('screen_frame_bytes', (imageDataBytes) => {
             const blob = new Blob([imageDataBytes], { type: 'image/jpeg' });
             const newImageUrl = URL.createObjectURL(blob);
@@ -166,114 +164,24 @@ INTERFACE_HTML = """
             currentImageUrl = newImageUrl;
             screenImage.src = newImageUrl;
         });
-
-        // --- Ping / Latency ---
-        setInterval(() => {
-            const start = Date.now();
-            socket.emit('ping_from_browser', () => {
-                const latency = Date.now() - start;
-                latencyText.textContent = `(${latency}ms)`;
-            });
-        }, 2000);
-
-        // --- Mouse & Keyboard Handlers (Unchanged, collapsed for brevity) ---
+        setInterval(() => { const start = Date.now(); socket.emit('ping_from_browser', () => { const latency = Date.now() - start; latencyText.textContent = `(${latency}ms)`; }); }, 2000);
         screenImage.addEventListener('mousemove', (event) => { if (!remoteScreenWidth) return; const rect = screenImage.getBoundingClientRect(); const x = event.clientX - rect.left; const y = event.clientY - rect.top; const remoteX = Math.round((x / rect.width) * remoteScreenWidth); const remoteY = Math.round((y / rect.height) * remoteScreenHeight); socket.emit('control_command', { action: 'move', x: remoteX, y: remoteY }); });
         screenImage.addEventListener('click', (event) => { if (!remoteScreenWidth) return; const rect = screenImage.getBoundingClientRect(); const x = event.clientX - rect.left; const y = event.clientY - rect.top; const remoteX = Math.round((x / rect.width) * remoteScreenWidth); const remoteY = Math.round((y / rect.height) * remoteScreenHeight); socket.emit('control_command', { action: 'click', button: 'left', x: remoteX, y: remoteY }); document.body.focus(); });
         screenImage.addEventListener('contextmenu', (event) => { event.preventDefault(); if (!remoteScreenWidth) return; const rect = screenImage.getBoundingClientRect(); const x = event.clientX - rect.left; const y = event.clientY - rect.top; const remoteX = Math.round((x / rect.width) * remoteScreenWidth); const remoteY = Math.round((y / rect.height) * remoteScreenHeight); socket.emit('control_command', { action: 'click', button: 'right', x: remoteX, y: remoteY }); document.body.focus(); });
         screenImage.addEventListener('wheel', (event) => { event.preventDefault(); const dY = event.deltaY > 0 ? 1 : (event.deltaY < 0 ? -1 : 0); if (dY) socket.emit('control_command', { action: 'scroll', dy: dY }); });
         document.body.addEventListener('keydown', (event) => { if (document.activeElement.tagName === 'TEXTAREA') return; const keysToPrevent = ['Tab', 'Enter', 'Escape', 'Backspace', 'Delete', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' ']; if (keysToPrevent.includes(event.key) || (event.key.length === 1 && !event.ctrlKey && !event.altKey && !event.metaKey)) { event.preventDefault(); } socket.emit('control_command', { action: 'keydown', key: event.key, code: event.code }); });
         document.body.addEventListener('keyup', (event) => { if (document.activeElement.tagName === 'TEXTAREA') return; socket.emit('control_command', { action: 'keyup', key: event.key, code: event.code }); });
-
-        // --- UI & Feature Handlers ---
         toggleTextModeButton.addEventListener('click', () => { document.body.classList.toggle('text-input-mode'); });
-        document.getElementById('send-injection-text-button').addEventListener('click', () => {
-            const text = document.getElementById('injection-text').value;
-            socket.emit('set_injection_text', { text_to_inject: text });
-        });
-        socket.on('text_injection_set_ack', (data) => {
-            const statusEl = document.getElementById('injection-status');
-            statusEl.textContent = data.status === 'success' ? 'Text saved for client!' : `Error: ${data.message || 'Failed to save.'}`;
-            setTimeout(() => { statusEl.textContent = ''; }, 3000);
-        });
-
-        // --- Dynamic Settings ---
-        function sendSettingsUpdate() {
-            socket.emit('update_client_settings', {
-                quality: parseInt(qualitySlider.value, 10),
-                fps: parseInt(fpsSlider.value, 10)
-            });
-        }
+        document.getElementById('send-injection-text-button').addEventListener('click', () => { const text = document.getElementById('injection-text').value; socket.emit('set_injection_text', { text_to_inject: text }); });
+        socket.on('text_injection_set_ack', (data) => { const statusEl = document.getElementById('injection-status'); statusEl.textContent = data.status === 'success' ? 'Text saved for client!' : `Error: ${data.message || 'Failed to save.'}`; setTimeout(() => { statusEl.textContent = ''; }, 3000); });
+        function sendSettingsUpdate() { socket.emit('update_client_settings', { quality: parseInt(qualitySlider.value, 10), fps: parseInt(fpsSlider.value, 10) }); }
         qualitySlider.addEventListener('change', sendSettingsUpdate);
         fpsSlider.addEventListener('change', sendSettingsUpdate);
-
-        // --- Clipboard Sync ---
-        socket.on('update_browser_clipboard', (data) => {
-            if (navigator.clipboard && data.text) {
-                navigator.clipboard.writeText(data.text).catch(err => console.error('Failed to write to browser clipboard:', err));
-            }
-        });
-        document.addEventListener('paste', (event) => {
-            if (document.activeElement === document.body) {
-                const text = event.clipboardData.getData('text');
-                if (text) socket.emit('clipboard_from_browser', { text: text });
-            }
-        });
-
-        // --- File Upload ---
+        socket.on('update_browser_clipboard', (data) => { if (navigator.clipboard && data.text) { navigator.clipboard.writeText(data.text).catch(err => console.error('Failed to write to browser clipboard:', err)); } });
+        document.addEventListener('paste', (event) => { if (document.activeElement === document.body) { const text = event.clipboardData.getData('text'); if (text) socket.emit('clipboard_from_browser', { text: text }); } });
         uploadButton.addEventListener('click', () => fileInput.click());
-        fileInput.addEventListener('change', (event) => {
-            const file = event.target.files[0];
-            if (file) uploadFile(file);
-            fileInput.value = ''; // Reset for next selection
-        });
-        function uploadFile(file) {
-            const CHUNK_SIZE = 1024 * 1024; // 1MB
-            let offset = 0;
-            const progressContainer = document.getElementById('file-progress-container');
-            const progressText = document.getElementById('file-name-progress');
-            const progressBar = document.getElementById('file-progress');
-            const progressPercent = document.getElementById('file-percent-progress');
-
-            progressText.textContent = `Uploading: ${file.name}`;
-            progressContainer.style.display = 'block';
-
-            function readChunk() {
-                const slice = file.slice(offset, offset + CHUNK_SIZE);
-                const reader = new FileReader();
-                reader.onload = (e) => {
-                    if (e.target.error) {
-                        console.error('File read error:', e.target.error);
-                        progressContainer.style.display = 'none';
-                        return;
-                    }
-                    socket.emit('file_chunk', {
-                        name: file.name,
-                        data: e.target.result,
-                        offset: offset
-                    }, (ack) => {
-                        if (ack.status !== 'ok') {
-                            console.error('File chunk upload failed:', ack.message);
-                            progressContainer.style.display = 'none';
-                            return;
-                        }
-
-                        offset += e.target.result.byteLength;
-                        const percentComplete = Math.round((offset / file.size) * 100);
-                        progressBar.style.width = `${percentComplete}%`;
-                        progressPercent.textContent = `${percentComplete}%`;
-
-                        if (offset < file.size) {
-                            readChunk();
-                        } else {
-                            socket.emit('file_upload_complete', { name: file.name, size: file.size });
-                            setTimeout(() => { progressContainer.style.display = 'none'; }, 2000);
-                        }
-                    });
-                };
-                reader.readAsArrayBuffer(slice);
-            }
-            readChunk();
-        }
+        fileInput.addEventListener('change', (event) => { const file = event.target.files[0]; if (file) uploadFile(file); fileInput.value = ''; });
+        function uploadFile(file) { const CHUNK_SIZE = 1024 * 1024; let offset = 0; const progressContainer = document.getElementById('file-progress-container'); const progressText = document.getElementById('file-name-progress'); const progressBar = document.getElementById('file-progress'); const progressPercent = document.getElementById('file-percent-progress'); progressText.textContent = `Uploading: ${file.name}`; progressContainer.style.display = 'block'; function readChunk() { const slice = file.slice(offset, offset + CHUNK_SIZE); const reader = new FileReader(); reader.onload = (e) => { if (e.target.error) { console.error('File read error:', e.target.error); progressContainer.style.display = 'none'; return; } socket.emit('file_chunk', { name: file.name, data: e.target.result, offset: offset }, (ack) => { if (ack.status !== 'ok') { console.error('File chunk upload failed:', ack.message); progressContainer.style.display = 'none'; return; } offset += e.target.result.byteLength; const percentComplete = Math.round((offset / file.size) * 100); progressBar.style.width = `${percentComplete}%`; progressPercent.textContent = `${percentComplete}%`; if (offset < file.size) { readChunk(); } else { socket.emit('file_upload_complete', { name: file.name, size: file.size }); setTimeout(() => { progressContainer.style.display = 'none'; }, 2000); } }); }; reader.readAsArrayBuffer(slice); } readChunk(); }
     });
     </script>
 </body>
@@ -286,19 +194,23 @@ def index():
     if request.method == 'POST':
         password = request.form.get('password')
         if check_auth(password):
-            session['authenticated'] = True; return redirect(url_for('interface'))
+            session['authenticated'] = True
+            return redirect(url_for('interface'))
         return render_template_string(LOGIN_HTML, error="Invalid password")
-    if session.get('authenticated'): return redirect(url_for('interface'))
+    if session.get('authenticated'):
+        return redirect(url_for('interface'))
     return render_template_string(LOGIN_HTML)
 
 @app.route('/interface')
 def interface():
-    if not session.get('authenticated'): return redirect(url_for('index'))
+    if not session.get('authenticated'):
+        return redirect(url_for('index'))
     return render_template_string(INTERFACE_HTML)
 
 @app.route('/logout')
 def logout():
-    session.pop('authenticated', None); return redirect(url_for('index'))
+    session.pop('authenticated', None)
+    return redirect(url_for('index'))
 
 # --- SocketIO Events ---
 @socketio.on('connect')
@@ -307,9 +219,18 @@ def handle_connect():
 
 @socketio.on('disconnect')
 def handle_disconnect():
-    logger.info(f"Browser disconnected: SID={request.sid}")
-    # This disconnect could be a browser tab, not the remote client.
-    # The remote client's disconnect is handled separately when its SID matches.
+    # This disconnect could be a browser tab or the remote client.
+    # The remote client's specific disconnect logic is in the next handler.
+    logger.info(f"A client disconnected: SID={request.sid}")
+
+@socketio.on('disconnect', namespace='/')
+def handle_client_disconnect():
+    # This specifically checks if the disconnecting client is our registered PC
+    client_pc_sid = redis_client.get(CLIENT_REDIS_KEY)
+    if request.sid == client_pc_sid:
+        logger.warning(f"Remote PC (SID: {client_pc_sid}) disconnected. Clearing Redis key.")
+        redis_client.delete(CLIENT_REDIS_KEY)
+        emit('client_disconnected', broadcast=True, include_self=False)
 
 @socketio.on('register_client')
 def handle_register_client(data):
@@ -319,24 +240,18 @@ def handle_register_client(data):
         old_sid = redis_client.get(CLIENT_REDIS_KEY)
         if old_sid and old_sid != sid:
             logger.warning(f"New client auth, disconnecting old client (SID: {old_sid})")
-            try: server_disconnect_client(old_sid, silent=True)
-            except Exception: pass # Ignore errors if old client is already gone
-        
+            try:
+                server_disconnect_client(old_sid, silent=True)
+            except Exception:
+                pass # Ignore errors if old client is already gone
         redis_client.set(CLIENT_REDIS_KEY, sid)
         logger.info(f"Remote PC registered (SID: {sid}). State saved to Redis.")
         emit('client_connected', broadcast=True, include_self=False)
         emit('registration_success', room=sid)
     else:
-        emit('registration_fail', {'message': 'Auth failed.'}, room=sid); server_disconnect_client(sid)
-
-# Overridden disconnect to handle remote client state
-@socketio.on('disconnect', namespace='/')
-def handle_client_disconnect():
-    client_pc_sid = redis_client.get(CLIENT_REDIS_KEY)
-    if request.sid == client_pc_sid:
-        logger.warning(f"Remote PC (SID: {client_pc_sid}) disconnected. Clearing Redis key.")
-        redis_client.delete(CLIENT_REDIS_KEY)
-        emit('client_disconnected', broadcast=True, include_self=False)
+        logger.warning(f"Client registration failed for SID {sid}. Incorrect password.")
+        emit('registration_fail', {'message': 'Auth failed.'}, room=sid)
+        server_disconnect_client(sid)
 
 @socketio.on('check_client_status')
 def check_client_status():
@@ -345,7 +260,6 @@ def check_client_status():
 
 @socketio.on('ping_from_browser')
 def handle_ping():
-    # Just acknowledging the event is enough for the client to calculate latency
     pass
 
 @socketio.on('screen_data_bytes')
@@ -353,15 +267,12 @@ def handle_screen_data_bytes(data):
     if redis_client.get(CLIENT_REDIS_KEY) == request.sid:
         emit('screen_frame_bytes', data, broadcast=True, include_self=False)
 
-# This function forwards any command to the client PC
 def forward_to_client(event, data):
     client_pc_sid = redis_client.get(CLIENT_REDIS_KEY)
     if client_pc_sid:
         socketio.emit(event, data, room=client_pc_sid)
         return True
     return False
-
-# --- Feature-specific Event Handlers ---
 
 @socketio.on('control_command')
 def handle_control_command(data):
@@ -411,5 +322,7 @@ if __name__ == '__main__':
     logger.info("--- Advanced Remote Server Starting ---")
     port = int(os.environ.get('PORT', 5000)); host = '0.0.0.0'
     logger.info(f"Listening on http://{host}:{port}")
-    if ACCESS_PASSWORD == '1': logger.warning("USING DEFAULT SERVER ACCESS PASSWORD '1'!")
+    if ACCESS_PASSWORD == '1':
+        logger.warning("USING DEFAULT SERVER ACCESS PASSWORD '1'!")
+    # Use socketio.run() to correctly start the eventlet server
     socketio.run(app, host=host, port=port, debug=False)
